@@ -12,6 +12,7 @@ import {
   type AppServerTurnResult,
 } from './create-app-server-event-handler';
 import type { CodexStepTracker } from './codex-step-tracker';
+import { createCodexUsageLedger } from './codex-usage-ledger';
 import type { CodexEvent } from './create-emit-stream-event';
 import { isDeepStrictEqual } from 'node:util';
 import {
@@ -54,12 +55,16 @@ export function createCodexAppServerRuntime(): {
   let loadedThreadId: string | undefined;
   let loadedConfig: Record<string, unknown> | undefined;
   let activeTurn: ActiveTurn | undefined;
+  // Token accounting outlives a single turn (sub-agent baselines, usage that
+  // arrives between turns) but not the app-server process it describes.
+  const usageLedger = createCodexUsageLedger();
 
   const close = async (): Promise<void> => {
     const previous = client;
     client = undefined;
     loadedThreadId = undefined;
     loadedConfig = undefined;
+    usageLedger.reset();
     await previous?.close();
   };
 
@@ -99,6 +104,7 @@ export function createCodexAppServerRuntime(): {
       emitStreamEvent: options.emitStreamEvent,
       emitWarning: turn.emitWarning,
       emitError: turn.emitError,
+      usageLedger,
     });
     const dynamicTools = createDynamicTools(start.tools ?? []);
     let rejectProtocolFailure: (error: unknown) => void = () => {};
@@ -124,7 +130,12 @@ export function createCodexAppServerRuntime(): {
         cwd: workdir,
         env: process.env,
         onNotification: notification => {
-          if (client !== created || activeTurn == null) return;
+          if (client !== created) return;
+          if (activeTurn == null) {
+            // No turn is listening (between turns); keep the usage for the next.
+            usageLedger.handleNotification(notification);
+            return;
+          }
           const params = asRecord(notification.params);
           if (
             notification.method === 'turn/started' &&
@@ -189,6 +200,9 @@ export function createCodexAppServerRuntime(): {
     let removeAbortListener = () => {};
     const abortFailure = new Promise<never>((_, reject) => {
       const onAbort = () => {
+        // The host stops listening on abort; usage reported from here on is
+        // held for the next turn instead of being emitted into the void.
+        usageLedger.end();
         if (currentTurn.threadId != null && currentTurn.turnId != null) {
           void runningClient
             .request({
@@ -325,7 +339,9 @@ export function createCodexAppServerRuntime(): {
         });
         loadedThreadId = currentTurn.threadId;
       }
-      handler.announceThread(currentTurn.threadId!);
+      handler.announceThread(currentTurn.threadId!, {
+        resumed: threadId != null,
+      });
       emit({ type: 'stream-start' });
       const turnResponse = await raceWithProcess({
         operation: runningClient.request({
@@ -373,6 +389,7 @@ export function createCodexAppServerRuntime(): {
       turn.experimental_userMessages.close();
       stopSteering();
       removeAbortListener();
+      usageLedger.end();
       if (activeTurn === currentTurn) activeTurn = undefined;
       if (!keepClient) await close();
     }

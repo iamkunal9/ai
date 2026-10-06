@@ -131,6 +131,7 @@ describe('createAppServerEventHandler', () => {
           "total": 17,
         },
         "outputTokens": {
+          "reasoning": 0,
           "text": 8,
           "total": 8,
         },
@@ -181,6 +182,8 @@ describe('createAppServerEventHandler', () => {
         },
         {
           "rawValue": {
+            "cumulative": true,
+            "scope": "turn",
             "type": "codex-token-usage",
             "usage": {
               "inputTokens": {
@@ -190,6 +193,7 @@ describe('createAppServerEventHandler', () => {
                 "total": 10,
               },
               "outputTokens": {
+                "reasoning": 0,
                 "text": 3,
                 "total": 3,
               },
@@ -199,6 +203,8 @@ describe('createAppServerEventHandler', () => {
         },
         {
           "rawValue": {
+            "cumulative": true,
+            "scope": "turn",
             "type": "codex-token-usage",
             "usage": {
               "inputTokens": {
@@ -208,6 +214,7 @@ describe('createAppServerEventHandler', () => {
                 "total": 17,
               },
               "outputTokens": {
+                "reasoning": 0,
                 "text": 8,
                 "total": 8,
               },

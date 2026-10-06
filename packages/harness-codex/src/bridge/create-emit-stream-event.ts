@@ -105,8 +105,17 @@ export function createEmitStreamEvent({
         // Forward the running turn total as it changes. Step usage only reaches
         // the host when a step closes, which can be a long time away (e.g. while
         // sub-agents work), so consumers that must not lose usage on abort or
-        // failure can read this instead.
-        send({ type: 'raw', rawValue: { type: 'codex-token-usage', usage } });
+        // failure read this instead. It is a cumulative snapshot: it replaces
+        // the previous value and must never be summed.
+        send({
+          type: 'raw',
+          rawValue: {
+            type: 'codex-token-usage',
+            scope: 'turn',
+            cumulative: true,
+            usage,
+          },
+        });
       }
       return;
     }
@@ -369,6 +378,9 @@ function mapUsage(usage: Record<string, number>): Record<string, unknown> {
   const input = usage.input_tokens ?? 0;
   const cacheRead = usage.cached_input_tokens ?? 0;
   const cacheWrite = usage.cache_write_input_tokens ?? 0;
+  const output = usage.output_tokens ?? 0;
+  // Codex counts reasoning tokens inside `output_tokens`.
+  const reasoning = Math.min(output, usage.reasoning_output_tokens ?? 0);
   return {
     inputTokens: {
       total: input,
@@ -377,8 +389,9 @@ function mapUsage(usage: Record<string, number>): Record<string, unknown> {
       cacheWrite,
     },
     outputTokens: {
-      total: usage.output_tokens ?? 0,
-      text: usage.output_tokens ?? 0,
+      total: output,
+      text: output - reasoning,
+      reasoning,
     },
   };
 }

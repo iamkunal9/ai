@@ -905,6 +905,18 @@ export function runPrompt<
           await lifecycle.start(modelId);
         }
 
+        // `raw` is out-of-band adapter data: it must not open a step (span) or
+        // become part of one, so pass it straight through.
+        if (value.type === 'raw') {
+          for (const part of translateStreamPart<TOOLS>(
+            value,
+            translateOptions,
+          )) {
+            result.enqueueContinuation(part);
+          }
+          continue;
+        }
+
         // Open a step span lazily before the first content of each step.
         if (
           value.type !== 'stream-start' &&

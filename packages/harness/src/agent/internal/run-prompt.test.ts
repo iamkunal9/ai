@@ -617,6 +617,47 @@ describe('runPrompt telemetry lifecycle', () => {
   });
 });
 
+describe('runPrompt raw parts', () => {
+  test('passes raw parts through without opening a step or adding to one', async () => {
+    const { result, done } = runPrompt({
+      harness,
+      session: fakeSession([
+        { type: 'stream-start' },
+        { type: 'text-start', id: 't1' },
+        { type: 'text-delta', id: 't1', delta: 'one' },
+        { type: 'text-end', id: 't1' },
+        finishEvents[0]!,
+        // Arrives between two steps; must not open a phantom step.
+        { type: 'raw', rawValue: { marker: 'between-steps' } },
+        { type: 'text-start', id: 't2' },
+        { type: 'text-delta', id: 't2', delta: 'two' },
+        { type: 'text-end', id: 't2' },
+        finishEvents[0]!,
+        finishEvents[1]!,
+      ]),
+      prompt: 'go',
+      instructions: undefined,
+      tools: {} as ToolSet,
+      toolSpecs: [],
+      sandboxSession,
+      sessionWorkDir: WORK_DIR,
+      runtimeContext: {} as never,
+      abortSignal: undefined,
+    });
+
+    const types: string[] = [];
+    for await (const part of result.fullStream) types.push(part.type);
+    await done;
+
+    const raw = types.indexOf('raw');
+    expect(raw).toBeGreaterThan(-1);
+    // The part before `raw` closes the first step; the next step opens after it.
+    expect(types[raw - 1]).toBe('finish-step');
+    expect(types[raw + 1]).toBe('start-step');
+    expect(await result.steps).toHaveLength(2);
+  });
+});
+
 describe('runPrompt stop-condition telemetry', () => {
   test('reports the usage of every step as the turn total when a stop condition ends the turn', async () => {
     const stepUsage = (input: number, output: number) => ({

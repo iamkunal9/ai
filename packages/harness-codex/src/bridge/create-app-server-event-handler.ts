@@ -2,18 +2,11 @@ import type { BridgeTurn } from '@ai-sdk/harness/bridge';
 import type { CodexStepTracker } from './codex-step-tracker';
 import type { CodexEvent, CodexItem } from './create-emit-stream-event';
 import type { CodexAppServerNotification } from './codex-app-server-client';
-
-type UsageBreakdown = {
-  inputTokens: number;
-  cachedInputTokens: number;
-  cacheWriteInputTokens: number;
-  outputTokens: number;
-};
-
-type UsageSnapshot = { total: UsageBreakdown; last: UsageBreakdown };
-
-const MAX_PENDING_USAGE_THREADS = 32;
-const MAX_PENDING_USAGE_PER_THREAD = 64;
+import {
+  createCodexUsageLedger,
+  toLegacyUsage,
+  type CodexUsageLedger,
+} from './codex-usage-ledger';
 
 export type AppServerTurnResult = {
   status: string;
@@ -33,13 +26,16 @@ export function createAppServerEventHandler({
   emitStreamEvent,
   emitWarning,
   emitError,
+  usageLedger = createCodexUsageLedger(),
 }: {
   stepTracker: CodexStepTracker;
   emitStreamEvent: (event: CodexEvent) => void;
   emitWarning: BridgeTurn['emitWarning'];
   emitError: BridgeTurn['emitError'];
+  /** Token accounting; shared across turns so sub-agent state survives them. */
+  usageLedger?: CodexUsageLedger;
 }): {
-  announceThread(threadId: string): void;
+  announceThread(threadId: string, options?: { resumed?: boolean }): void;
   handle(notification: CodexAppServerNotification): void;
   setTurnId(turnId: string): void;
   waitForCompletion(): Promise<AppServerTurnResult>;
@@ -47,16 +43,6 @@ export function createAppServerEventHandler({
   let activeThreadId: string | undefined;
   let activeTurnId: string | undefined;
   let settled = false;
-  let accumulatedUsage: UsageBreakdown = emptyUsageBreakdown();
-  // Token usage is per thread: sub-agents run as their own threads and the
-  // parent's total excludes them. A thread is counted only once it is known to
-  // belong to this turn's family, i.e. the active thread, or a thread a
-  // counted thread spawned (announced by a `collabAgentToolCall` item).
-  const countedThreads = new Set<string>();
-  const lastTotalByThread = new Map<string, UsageBreakdown>();
-  // Usage seen for a thread before its spawn was announced. Bounded so
-  // unrelated threads on the connection cannot grow it without limit.
-  const pendingUsageByThread = new Map<string, UsageSnapshot[]>();
   const textByItem = new Map<string, string>();
   const reasoningByItem = new Map<string, string>();
   const nativeToolCalls = new Map<string, NativeToolCall>();
@@ -64,10 +50,21 @@ export function createAppServerEventHandler({
   const completion = new Promise<AppServerTurnResult>(resolve => {
     resolveCompletion = resolve;
   });
-  const announceThread = (threadId: string): void => {
+  const announceThread = (
+    threadId: string,
+    options?: { resumed?: boolean },
+  ): void => {
     if (activeThreadId != null) return;
     activeThreadId = threadId;
-    countedThreads.add(threadId);
+    usageLedger.begin({
+      threadId,
+      // A thread announced by `thread/started` is always new.
+      resumed: options?.resumed ?? false,
+      // Report as it happens so an aborted or failed turn keeps its usage.
+      onChange: usage =>
+        emitStreamEvent({ type: 'usage.updated', usage: toLegacyUsage(usage) }),
+      onWarning: message => emitWarning({ message }),
+    });
     emitStreamEvent({ type: 'thread.started', thread_id: threadId });
   };
 
@@ -169,66 +166,11 @@ export function createAppServerEventHandler({
     });
   };
 
-  const recordUsage = (
-    threadId: string,
-    { total, last }: UsageSnapshot,
-  ): void => {
-    const previous = lastTotalByThread.get(threadId);
-    // Diff cumulative totals so a repeated or skipped snapshot never
-    // double counts; the first snapshot of a thread falls back to `last`
-    // (a resumed thread's total includes earlier turns).
-    const increment =
-      previous == null ? last : positiveDifference(total, previous);
-    lastTotalByThread.set(
-      threadId,
-      previous == null ? total : maxUsage(previous, total),
-    );
-    // A repeated snapshot adds nothing and needs no report.
-    if (Object.values(increment).every(count => count === 0)) return;
-    accumulatedUsage = addUsage({ total: accumulatedUsage, increment });
-    // Report as it happens so an aborted or failed turn keeps its usage.
-    emitStreamEvent({
-      type: 'usage.updated',
-      usage: toLegacyUsage(accumulatedUsage),
-    });
-  };
-
-  const countThread = (threadId: string): void => {
-    if (countedThreads.has(threadId)) return;
-    countedThreads.add(threadId);
-    for (const snapshot of pendingUsageByThread.get(threadId) ?? []) {
-      recordUsage(threadId, snapshot);
-    }
-    pendingUsageByThread.delete(threadId);
-  };
-
-  const bufferUsage = (threadId: string, snapshot: UsageSnapshot): void => {
-    const buffered = pendingUsageByThread.get(threadId);
-    if (buffered != null) {
-      if (buffered.length < MAX_PENDING_USAGE_PER_THREAD) {
-        buffered.push(snapshot);
-      }
-    } else if (pendingUsageByThread.size < MAX_PENDING_USAGE_THREADS) {
-      pendingUsageByThread.set(threadId, [snapshot]);
-    }
-  };
-
-  // A counted thread announcing the threads it started or addressed (any depth).
-  const observeSpawnedThreads = (params: Record<string, unknown>): void => {
-    const item = asRecord(params.item);
-    if (item?.type !== 'collabAgentToolCall') return;
-    // Trust where the notification came from, not who the item claims sent it.
-    const sender = params.threadId;
-    if (typeof sender !== 'string' || !countedThreads.has(sender)) return;
-    for (const receiver of stringArray(item.receiverThreadIds)) {
-      countThread(receiver);
-    }
-  };
-
   return {
     announceThread,
     setTurnId(turnId) {
       activeTurnId = turnId;
+      usageLedger.setTurnId(turnId);
     },
     handle(notification) {
       const params = asRecord(notification.params);
@@ -244,16 +186,13 @@ export function createAppServerEventHandler({
           typeof turn?.id === 'string'
         ) {
           activeTurnId = turn.id;
+          usageLedger.setTurnId(turn.id);
         }
         return;
       }
-      if (
-        (notification.method === 'item/started' ||
-          notification.method === 'item/completed') &&
-        params != null
-      ) {
-        observeSpawnedThreads(params);
-      }
+      // Usage and sub-agent announcements are accounted for by the ledger,
+      // across every thread on the connection, not just the active turn.
+      usageLedger.handleNotification(notification);
       if (notification.method === 'item/started' && params != null) {
         handleItem({ eventType: 'item.started', params });
         return;
@@ -299,28 +238,7 @@ export function createAppServerEventHandler({
         });
         return;
       }
-      if (
-        notification.method === 'thread/tokenUsage/updated' &&
-        params != null &&
-        typeof params.threadId === 'string'
-      ) {
-        const tokenUsage = asRecord(params.tokenUsage);
-        const total = readUsageBreakdown(tokenUsage?.total);
-        const last = readUsageBreakdown(tokenUsage?.last);
-        if (total == null || last == null) return;
-        const snapshot = { total, last };
-        if (params.threadId === activeThreadId) {
-          // Active thread: only this turn's usage (not a stale earlier turn).
-          if (matchesActiveTurn({ params, activeThreadId, activeTurnId })) {
-            recordUsage(params.threadId, snapshot);
-          }
-        } else if (countedThreads.has(params.threadId)) {
-          recordUsage(params.threadId, snapshot);
-        } else {
-          bufferUsage(params.threadId, snapshot);
-        }
-        return;
-      }
+      if (notification.method === 'thread/tokenUsage/updated') return;
       if (notification.method === 'error' && params != null) {
         if (!matchesActiveTurn({ params, activeThreadId, activeTurnId }))
           return;
@@ -373,7 +291,7 @@ export function createAppServerEventHandler({
         }
         emitStreamEvent({
           type: 'turn.completed',
-          usage: toLegacyUsage(accumulatedUsage),
+          usage: toLegacyUsage(usageLedger.turnUsage()),
         });
         resolveCompletion({
           status,
@@ -551,77 +469,4 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((entry): entry is string => typeof entry === 'string')
     : [];
-}
-
-function emptyUsageBreakdown(): UsageBreakdown {
-  return {
-    inputTokens: 0,
-    cachedInputTokens: 0,
-    cacheWriteInputTokens: 0,
-    outputTokens: 0,
-  };
-}
-
-function readUsageBreakdown(value: unknown): UsageBreakdown | undefined {
-  const usage = asRecord(value);
-  if (usage == null) return undefined;
-  return {
-    inputTokens: numberOrZero(usage.inputTokens),
-    cachedInputTokens: numberOrZero(usage.cachedInputTokens),
-    cacheWriteInputTokens: numberOrZero(usage.cacheWriteInputTokens),
-    outputTokens: numberOrZero(usage.outputTokens),
-  };
-}
-
-function addUsage({
-  total,
-  increment,
-}: {
-  total: UsageBreakdown;
-  increment: UsageBreakdown;
-}): UsageBreakdown {
-  return {
-    inputTokens: total.inputTokens + increment.inputTokens,
-    cachedInputTokens: total.cachedInputTokens + increment.cachedInputTokens,
-    cacheWriteInputTokens:
-      total.cacheWriteInputTokens + increment.cacheWriteInputTokens,
-    outputTokens: total.outputTokens + increment.outputTokens,
-  };
-}
-
-function mapUsageFields(
-  a: UsageBreakdown,
-  b: UsageBreakdown,
-  fn: (x: number, y: number) => number,
-): UsageBreakdown {
-  return {
-    inputTokens: fn(a.inputTokens, b.inputTokens),
-    cachedInputTokens: fn(a.cachedInputTokens, b.cachedInputTokens),
-    cacheWriteInputTokens: fn(a.cacheWriteInputTokens, b.cacheWriteInputTokens),
-    outputTokens: fn(a.outputTokens, b.outputTokens),
-  };
-}
-
-function positiveDifference(
-  current: UsageBreakdown,
-  previous: UsageBreakdown,
-): UsageBreakdown {
-  return mapUsageFields(current, previous, (x, y) => Math.max(0, x - y));
-}
-
-function maxUsage(a: UsageBreakdown, b: UsageBreakdown): UsageBreakdown {
-  return mapUsageFields(a, b, Math.max);
-}
-
-function toLegacyUsage(usage: UsageBreakdown): Record<string, number> {
-  return {
-    input_tokens: usage.inputTokens,
-    cached_input_tokens: usage.cachedInputTokens,
-    cache_write_input_tokens: usage.cacheWriteInputTokens,
-    output_tokens: usage.outputTokens,
-  };
-}
-
-function numberOrZero(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
