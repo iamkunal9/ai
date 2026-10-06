@@ -674,6 +674,66 @@ describe('CodexUsageLedger', () => {
     });
   });
 
+  describe('carry-over and queued announcements', () => {
+    it('hands carried-over usage to exactly one turn', () => {
+      const s = createSession();
+      s.begin('p', { turnId: 't1' });
+      s.ledger.end();
+      s.feed(
+        usageNotification({
+          threadId: 'p',
+          turnId: 't1',
+          total: { input: 60, output: 6 },
+        }),
+      );
+      s.begin('p', { resumed: true, turnId: 't2' });
+      expect(s.total()).toEqual({ input: 60, output: 6 });
+      s.ledger.end();
+      s.begin('p', { resumed: true, turnId: 't3' });
+      expect(s.total()).toEqual({ input: 0, output: 0 });
+    });
+
+    it('keeps usage that was received but not billed when the process goes away', () => {
+      const s = createSession();
+      s.begin('p', { turnId: 't1' });
+      s.feed(
+        collabNotification({ sender: 'p', receivers: ['c'], turnId: 't1' }),
+      );
+      s.ledger.end();
+      s.feed(
+        usageNotification({
+          threadId: 'c',
+          turnId: 'c1',
+          total: { input: 8174, output: 90 },
+        }),
+      );
+      s.ledger.reset(); // the app-server was closed before the next turn
+      s.begin('p', { resumed: true, turnId: 't2' });
+      expect(s.total()).toEqual({ input: 8174, output: 90 });
+    });
+
+    it('does not let a later wait weaken a queued spawn announcement', () => {
+      const s = createSession();
+      s.begin('p');
+      s.feed(
+        collabNotification({
+          sender: 'child',
+          receivers: ['g'],
+          tool: 'spawnAgent',
+        }),
+        collabNotification({ sender: 'child', receivers: ['g'], tool: 'wait' }),
+        usageNotification({
+          threadId: 'g',
+          turnId: 'g1',
+          total: { input: 30, output: 3 },
+          last: { input: 10, output: 1 },
+        }),
+        collabNotification({ sender: 'p', receivers: ['child'] }),
+      );
+      expect(s.total()).toEqual({ input: 30, output: 3 });
+    });
+  });
+
   describe('bounds', () => {
     it('drops unrelated threads past the limit with a warning, never family threads', () => {
       const s = createSession();

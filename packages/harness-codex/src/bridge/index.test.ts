@@ -14,7 +14,13 @@ type AppServerOptions = {
     thread_id?: string;
     usage?: Record<string, number>;
   }): void;
-  stepTracker: { finishTurn(): void };
+  stepTracker: {
+    finishTurn(): void;
+    observeEvent(input: {
+      event: { type: string; item?: { type: string } };
+      itemId: string | undefined;
+    }): void;
+  };
 };
 
 const CODEX_ENV_KEYS = [
@@ -118,12 +124,15 @@ vi.mock('./codex-app-server-driver', () => ({
   createCodexAppServerRuntime: () => ({
     runTurn: async (options: AppServerOptions) => {
       state.appServerOptions.push(options);
-      if (state.appServerError != null) throw state.appServerError;
+      if (state.onRunTurn == null && state.appServerError != null) {
+        throw state.appServerError;
+      }
       options.emitStreamEvent({
         type: 'thread.started',
         thread_id: 'app-server-thread',
       });
       state.onRunTurn?.(options);
+      if (state.appServerError != null) throw state.appServerError;
     },
     close: async () => {
       state.appServerClosed++;
@@ -247,6 +256,28 @@ describe('Codex bridge config', () => {
     expect(new Set(ids.slice(0, 2)).size).toBe(1);
     expect(new Set(ids.slice(2)).size).toBe(1);
     expect(ids[0]).not.toBe(ids[2]);
+  });
+
+  test('flushes the open step with its usage before reporting a failed turn', async () => {
+    state.appServerError = new Error('codex failed');
+    state.onRunTurn = options => {
+      options.stepTracker.observeEvent({
+        event: { type: 'item.completed', item: { type: 'agent_message' } },
+        itemId: 'message-1',
+      });
+      options.emitStreamEvent({
+        type: 'usage.updated',
+        usage: { input_tokens: 100, output_tokens: 10 },
+      });
+    };
+
+    await import('./index');
+
+    const steps = state.emitted.filter(
+      message => message.type === 'finish-step',
+    );
+    expect(steps).toHaveLength(1);
+    expect(state.emittedErrors).toHaveLength(1);
   });
 
   test('reuses one runtime for turns and closes on stop and destroy', async () => {

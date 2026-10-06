@@ -75,7 +75,11 @@ export type CodexUsageLedger = {
   handleNotification(notification: CodexAppServerNotification): void;
   /** Usage billed to the current turn so far. */
   turnUsage(): UsageBreakdown;
-  /** Forget everything (the app-server process is gone). */
+  /**
+   * Forget what describes the app-server process that is gone. Usage already
+   * received but not yet billed to a turn is kept: it is real, and a new
+   * process baselines the threads it resumes.
+   */
   reset(): void;
 };
 
@@ -205,7 +209,8 @@ export function createCodexUsageLedger(): CodexUsageLedger {
     // Trust where the notification came from, not who the item claims sent it.
     const sender = params.threadId;
     if (typeof sender !== 'string') return;
-    // An announcement on the active thread must belong to the current turn.
+    // An announcement on the active thread must belong to the current turn
+    // (Codex runs turns serially, so a late one from an earlier turn is stale).
     if (
       active?.threadId === sender &&
       active.turnId != null &&
@@ -283,7 +288,6 @@ export function createCodexUsageLedger(): CodexUsageLedger {
       primaryThreadId = undefined;
       active = undefined;
       turnTotal = emptyUsage();
-      carryOver = emptyUsage();
     },
   };
 }

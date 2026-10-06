@@ -249,7 +249,8 @@ for await (const part of result.fullStream) {
   const raw = part.type === 'raw' ? (part.rawValue as { type?: string }) : null;
   if (raw?.type === 'codex-token-usage') {
     const { turnId, usage } = raw as { turnId: string; usage: unknown };
-    // Replace, never add: each part is the cumulative total of that turn.
+    // Cumulative total of that turn: replace the previous value for this
+    // `turnId` (keep the larger one if parts can arrive out of order), never add.
     usageByTurn.set(turnId, usage);
   }
 }
