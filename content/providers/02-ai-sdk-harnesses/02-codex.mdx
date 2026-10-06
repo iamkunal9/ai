@@ -243,18 +243,25 @@ the `raw` part the adapter emits whenever the running total of the turn
 changes:
 
 ```ts
+const usageByTurn = new Map<string, unknown>();
+
 for await (const part of result.fullStream) {
   const raw = part.type === 'raw' ? (part.rawValue as { type?: string }) : null;
   if (raw?.type === 'codex-token-usage') {
-    // Replace, never add: each part is the cumulative total of the turn.
-    latestTurnUsage = (raw as { usage: unknown }).usage;
+    const { turnId, usage } = raw as { turnId: string; usage: unknown };
+    // Replace, never add: each part is the cumulative total of that turn.
+    usageByTurn.set(turnId, usage);
   }
 }
 ```
 
 The `rawValue` has the shape
-`{ type: 'codex-token-usage', scope: 'turn', cumulative: true, usage }`, where
-`usage` is a `LanguageModelUsage`-shaped object. Persist what you receive:
+`{ type: 'codex-token-usage', scope: 'turn', cumulative: true, turnId, usage }`,
+where `usage` is a `LanguageModelUsage`-shaped object and `turnId` identifies
+the prompt turn that produced it. Keep the latest `usage` per `turnId` and add
+those up across turns: an event of a turn that was aborted can still reach the
+host while the next turn is already running, so a `raw` part does not
+necessarily belong to the turn you are reading. Persist what you receive:
 usage Codex only reports after the host stopped listening is not delivered for
 that turn.
 

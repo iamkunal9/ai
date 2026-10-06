@@ -72,6 +72,7 @@ function getMcpToolName(item: CodexItem): string {
 
 export function createEmitStreamEvent({
   send,
+  turnId,
   stepTracker,
   setTurnUsage,
   setThreadId,
@@ -79,6 +80,8 @@ export function createEmitStreamEvent({
   emitError,
 }: {
   send: Emit;
+  /** Identifies the prompt turn in `codex-token-usage` parts. */
+  turnId?: string;
   stepTracker: CodexStepTracker;
   setTurnUsage: (usage: Record<string, unknown>) => void;
   setThreadId: (threadId: string) => void;
@@ -113,6 +116,7 @@ export function createEmitStreamEvent({
             type: 'codex-token-usage',
             scope: 'turn',
             cumulative: true,
+            ...(turnId == null ? {} : { turnId }),
             usage,
           },
         });

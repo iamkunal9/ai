@@ -221,6 +221,34 @@ describe('Codex bridge config', () => {
     expect(types).not.toContain('finish');
   });
 
+  test('tags usage parts with an id that is stable within a turn and unique per turn', async () => {
+    state.runSecondTurn = true;
+    state.onRunTurn = options => {
+      options.emitStreamEvent({
+        type: 'usage.updated',
+        usage: { input_tokens: 5, output_tokens: 1 },
+      });
+      options.emitStreamEvent({
+        type: 'usage.updated',
+        usage: { input_tokens: 9, output_tokens: 2 },
+      });
+    };
+
+    await import('./index');
+
+    const ids = state.emitted
+      .filter(message => message.type === 'raw')
+      .map(
+        message =>
+          (message as unknown as { rawValue: { turnId: string } }).rawValue
+            .turnId,
+      );
+    expect(ids).toHaveLength(4);
+    expect(new Set(ids.slice(0, 2)).size).toBe(1);
+    expect(new Set(ids.slice(2)).size).toBe(1);
+    expect(ids[0]).not.toBe(ids[2]);
+  });
+
   test('reuses one runtime for turns and closes on stop and destroy', async () => {
     state.runSecondTurn = true;
 

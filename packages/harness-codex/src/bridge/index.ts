@@ -14,6 +14,7 @@ import type { StartMessage } from '../codex-bridge-protocol';
 import { createCodexAppServerRuntime } from './codex-app-server-driver';
 import { createCodexStepTracker, defaultUsage } from './codex-step-tracker';
 import { createEmitStreamEvent } from './create-emit-stream-event';
+import { randomUUID } from 'node:crypto';
 import { argv, env as procEnv, stdout } from 'node:process';
 
 const args = parseArgs(argv.slice(2));
@@ -66,6 +67,9 @@ async function runTurn(start: StartMessage, turn: BridgeTurn): Promise<void> {
   });
   const emitStreamEvent = createEmitStreamEvent({
     send: emit,
+    // Lets a consumer attribute a late event of this turn that reaches the
+    // host during the next one.
+    turnId: randomUUID(),
     stepTracker,
     setTurnUsage: usage => (turnUsage = usage),
     setThreadId: threadId => (threadState.id = threadId),
