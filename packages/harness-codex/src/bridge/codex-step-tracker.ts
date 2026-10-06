@@ -32,6 +32,16 @@ export function createCodexStepTracker(input: {
   let reportedUsage: Record<string, unknown> = defaultUsage();
   const pendingToolItemIds = new Set<string>();
 
+  const hasUnreportedUsage = (): boolean => {
+    const delta = subtractUsage(
+      input.getTurnUsage?.() ?? reportedUsage,
+      reportedUsage,
+    );
+    return [delta.inputTokens, delta.outputTokens].some(counts =>
+      Object.values(counts).some(count => (count ?? 0) > 0),
+    );
+  };
+
   const finishStep = (): void => {
     if (!stepOpen || pendingToolItemIds.size > 0) return;
     const turnUsage = input.getTurnUsage?.() ?? reportedUsage;
@@ -64,6 +74,9 @@ export function createCodexStepTracker(input: {
     },
     finishTurn() {
       pendingToolItemIds.clear();
+      // Usage can arrive with no step open (e.g. only sub-agents ran); report
+      // it rather than dropping it.
+      if (!stepOpen && hasUnreportedUsage()) stepOpen = true;
       finishStep();
     },
   };
@@ -101,7 +114,7 @@ type UsageCounts = Record<string, number | undefined>;
 function subtractUsage(
   current: Record<string, unknown>,
   previous: Record<string, unknown>,
-): Record<string, unknown> {
+): { inputTokens: UsageCounts; outputTokens: UsageCounts } {
   const diff = (key: 'inputTokens' | 'outputTokens'): UsageCounts => {
     const now = (current[key] ?? {}) as UsageCounts;
     const before = (previous[key] ?? {}) as UsageCounts;

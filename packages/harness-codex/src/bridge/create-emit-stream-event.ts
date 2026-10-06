@@ -99,7 +99,15 @@ export function createEmitStreamEvent({
       send({ type: 'bridge-thread', threadId: event.thread_id });
     }
     if (event.type === 'usage.updated') {
-      if (event.usage) setTurnUsage(mapUsage(event.usage));
+      if (event.usage) {
+        const usage = mapUsage(event.usage);
+        setTurnUsage(usage);
+        // Forward the running turn total as it changes. Step usage only reaches
+        // the host when a step closes, which can be a long time away (e.g. while
+        // sub-agents work), so consumers that must not lose usage on abort or
+        // failure can read this instead.
+        send({ type: 'raw', rawValue: { type: 'codex-token-usage', usage } });
+      }
       return;
     }
     if (event.type === 'turn.completed') {

@@ -179,6 +179,42 @@ describe('createAppServerEventHandler', () => {
             },
           },
         },
+        {
+          "rawValue": {
+            "type": "codex-token-usage",
+            "usage": {
+              "inputTokens": {
+                "cacheRead": 2,
+                "cacheWrite": 0,
+                "noCache": 8,
+                "total": 10,
+              },
+              "outputTokens": {
+                "text": 3,
+                "total": 3,
+              },
+            },
+          },
+          "type": "raw",
+        },
+        {
+          "rawValue": {
+            "type": "codex-token-usage",
+            "usage": {
+              "inputTokens": {
+                "cacheRead": 3,
+                "cacheWrite": 0,
+                "noCache": 14,
+                "total": 17,
+              },
+              "outputTokens": {
+                "text": 8,
+                "total": 8,
+              },
+            },
+          },
+          "type": "raw",
+        },
       ]
     `);
   });
@@ -569,6 +605,71 @@ describe('token usage reporting', () => {
       { input: 50, output: 5 },
     );
     expect(tokens(turnUsage())).toEqual([300, 30]);
+  });
+
+  it('forwards the running turn total live, so an abort mid sub-agent work loses nothing', () => {
+    const { report, spawn, emitted } = createUsageHarness();
+    const rawTotals = () =>
+      emitted
+        .filter(event => event.type === 'raw')
+        .map(event =>
+          tokens((event.rawValue as { usage: Record<string, unknown> }).usage),
+        );
+
+    spawn('parent', 'child');
+    report('parent', 'parent-turn', { input: 100, output: 10 });
+    report('child', 'child-turn', { input: 40, output: 4 });
+    report('child', 'child-turn', { input: 90, output: 9 });
+
+    // No step has closed and the turn never completes (cancelled), yet the host
+    // already has the latest running total through the raw events.
+    expect(emitted.some(event => event.type === 'finish-step')).toBe(false);
+    expect(rawTotals()).toEqual([
+      [100, 10],
+      [140, 14],
+      [190, 19],
+    ]);
+  });
+
+  it('reports usage that arrived with no open step when the turn fails', () => {
+    const { report, handler, emitted } = createUsageHarness();
+
+    report('parent', 'parent-turn', { input: 7543, output: 12 });
+    handler.handle({
+      method: 'error',
+      params: {
+        threadId: 'parent',
+        turnId: 'parent-turn',
+        willRetry: false,
+        error: { message: 'boom' },
+      },
+    });
+
+    const step = emitted.find(event => event.type === 'finish-step');
+    expect(tokens(step?.usage as Record<string, unknown>)).toEqual([7543, 12]);
+  });
+
+  it('only adopts threads announced from a counted thread, not by what an item claims', () => {
+    const { report, handler, turnUsage } = createUsageHarness();
+
+    // Arrives on an uncounted thread but claims the parent as its sender.
+    handler.handle({
+      method: 'item/completed',
+      params: {
+        threadId: 'stranger',
+        turnId: 'stranger-turn',
+        item: {
+          type: 'collabAgentToolCall',
+          id: 'fake',
+          tool: 'spawnAgent',
+          senderThreadId: 'parent',
+          receiverThreadIds: ['victim'],
+        },
+      },
+    });
+    report('victim', 'victim-turn', { input: 999_999, output: 1 });
+
+    expect(tokens(turnUsage())).toEqual([0, 0]);
   });
 
   it('flushes the open step with its usage before reporting a fatal error', () => {

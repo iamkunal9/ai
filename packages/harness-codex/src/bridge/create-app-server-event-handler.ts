@@ -183,6 +183,8 @@ export function createAppServerEventHandler({
       threadId,
       previous == null ? total : maxUsage(previous, total),
     );
+    // A repeated snapshot adds nothing and needs no report.
+    if (Object.values(increment).every(count => count === 0)) return;
     accumulatedUsage = addUsage({ total: accumulatedUsage, increment });
     // Report as it happens so an aborted or failed turn keeps its usage.
     emitStreamEvent({
@@ -211,14 +213,12 @@ export function createAppServerEventHandler({
     }
   };
 
-  // A counted thread announcing the threads it spawned (at any depth).
+  // A counted thread announcing the threads it started or addressed (any depth).
   const observeSpawnedThreads = (params: Record<string, unknown>): void => {
     const item = asRecord(params.item);
     if (item?.type !== 'collabAgentToolCall') return;
-    const sender =
-      typeof item.senderThreadId === 'string'
-        ? item.senderThreadId
-        : params.threadId;
+    // Trust where the notification came from, not who the item claims sent it.
+    const sender = params.threadId;
     if (typeof sender !== 'string' || !countedThreads.has(sender)) return;
     for (const receiver of stringArray(item.receiverThreadIds)) {
       countThread(receiver);
