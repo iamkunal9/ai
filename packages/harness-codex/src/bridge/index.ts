@@ -55,7 +55,10 @@ async function runTurn(start: StartMessage, turn: BridgeTurn): Promise<void> {
 
   const runtime = resolveCodexRuntime({ start });
   let turnUsage: Record<string, unknown> = defaultUsage();
-  const stepTracker = createCodexStepTracker({ send: emit });
+  const stepTracker = createCodexStepTracker({
+    send: emit,
+    getTurnUsage: () => turnUsage,
+  });
   const emitStreamEvent = createEmitStreamEvent({
     send: emit,
     stepTracker,

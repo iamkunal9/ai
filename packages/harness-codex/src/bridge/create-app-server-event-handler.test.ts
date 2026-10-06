@@ -448,6 +448,87 @@ describe('createAppServerEventHandler', () => {
   });
 });
 
+describe('token usage reporting', () => {
+  it('reports usage live, counts other threads, and keeps it if the turn never completes', () => {
+    let turnUsage: Record<string, unknown> = defaultUsage();
+    const stepUsages: unknown[] = [];
+    const send = (event: Record<string, unknown>) => {
+      if (event.type === 'finish-step') stepUsages.push(event.usage);
+    };
+    const stepTracker = createCodexStepTracker({
+      send,
+      getTurnUsage: () => turnUsage,
+    });
+    const handler = createAppServerEventHandler({
+      stepTracker,
+      emitStreamEvent: createEmitStreamEvent({
+        send,
+        stepTracker,
+        setTurnUsage: usage => (turnUsage = usage),
+        setThreadId: () => {},
+        emitWarning: vi.fn(),
+        emitError: vi.fn(),
+      }),
+      emitWarning: vi.fn(),
+      emitError: vi.fn(),
+    });
+    handler.announceThread('thread-1');
+    handler.setTurnId('turn-1');
+
+    const report = (
+      threadId: string,
+      turnId: string,
+      input: number,
+      output: number,
+      lastInput = input,
+      lastOutput = output,
+    ) =>
+      handler.handle({
+        method: 'thread/tokenUsage/updated',
+        params: {
+          threadId,
+          turnId,
+          tokenUsage: {
+            total: usageBreakdown({ input, cached: 0, output }),
+            last: usageBreakdown({
+              input: lastInput,
+              cached: 0,
+              output: lastOutput,
+            }),
+            modelContextWindow: 100_000,
+          },
+        },
+      });
+
+    report('thread-1', 'turn-1', 10, 3);
+    report('thread-1', 'turn-1', 10, 3); // repeated snapshot: not counted twice
+    report('thread-1', 'turn-0', 99, 99); // stale turn on the active thread: ignored
+    report('sub-thread', 'sub-turn', 5, 2); // other thread: counted
+
+    // The turn never completes (aborted); usage is already live.
+    expect(turnUsage).toMatchObject({
+      inputTokens: { total: 15 },
+      outputTokens: { total: 5 },
+    });
+
+    handler.handle({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { type: 'reasoning', id: 'r1', summary: [], content: [] },
+      },
+    });
+    stepTracker.finishTurn();
+    expect(stepUsages).toEqual([
+      expect.objectContaining({
+        inputTokens: expect.objectContaining({ total: 15 }),
+        outputTokens: expect.objectContaining({ total: 5 }),
+      }),
+    ]);
+  });
+});
+
 function createNativeToolHarness() {
   const emitted: Array<Record<string, unknown>> = [];
   const stepTracker = createCodexStepTracker({

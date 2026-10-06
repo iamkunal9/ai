@@ -38,6 +38,7 @@ export type CodexEvent = {
     | 'turn.completed'
     | 'turn.failed'
     | 'error'
+    | 'usage.updated'
     | 'item.started'
     | 'item.updated'
     | 'item.completed';
@@ -96,6 +97,10 @@ export function createEmitStreamEvent({
       setThreadId(event.thread_id);
       // Announce to the host so it can include the id in resume state.
       send({ type: 'bridge-thread', threadId: event.thread_id });
+    }
+    if (event.type === 'usage.updated') {
+      if (event.usage) setTurnUsage(mapUsage(event.usage));
+      return;
     }
     if (event.type === 'turn.completed') {
       if (event.usage) setTurnUsage(mapUsage(event.usage));

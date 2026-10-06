@@ -21,16 +21,26 @@ export type CodexStepTracker = {
 
 export function createCodexStepTracker(input: {
   send: Emit;
+  /**
+   * Returns the turn's cumulative usage so far. Each inferred step reports the
+   * tokens consumed since the previous step, so usage reaches the host while
+   * the turn is still running (and survives an abort or failure).
+   */
+  getTurnUsage?: () => Record<string, unknown>;
 }): CodexStepTracker {
   let stepOpen = false;
+  let reportedUsage: Record<string, unknown> = defaultUsage();
   const pendingToolItemIds = new Set<string>();
 
   const finishStep = (): void => {
     if (!stepOpen || pendingToolItemIds.size > 0) return;
+    const turnUsage = input.getTurnUsage?.() ?? reportedUsage;
+    const usage = subtractUsage(turnUsage, reportedUsage);
+    reportedUsage = turnUsage;
     input.send({
       type: 'finish-step',
       finishReason: { unified: 'stop', raw: 'stop' },
-      usage: defaultUsage(),
+      usage,
       harnessMetadata: { codex: { inferredStep: true } },
     });
     stepOpen = false;
@@ -83,5 +93,27 @@ export function defaultUsage(): Record<string, unknown> {
   return {
     inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
     outputTokens: { total: 0, text: 0 },
+  };
+}
+
+type UsageCounts = Record<string, number | undefined>;
+
+function subtractUsage(
+  current: Record<string, unknown>,
+  previous: Record<string, unknown>,
+): Record<string, unknown> {
+  const diff = (key: 'inputTokens' | 'outputTokens'): UsageCounts => {
+    const now = (current[key] ?? {}) as UsageCounts;
+    const before = (previous[key] ?? {}) as UsageCounts;
+    return Object.fromEntries(
+      Object.entries(now).map(([field, value]) => [
+        field,
+        Math.max(0, (value ?? 0) - (before[field] ?? 0)),
+      ]),
+    );
+  };
+  return {
+    inputTokens: diff('inputTokens'),
+    outputTokens: diff('outputTokens'),
   };
 }

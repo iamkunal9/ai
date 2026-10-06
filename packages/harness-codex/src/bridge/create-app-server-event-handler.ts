@@ -43,7 +43,9 @@ export function createAppServerEventHandler({
   let activeTurnId: string | undefined;
   let settled = false;
   let accumulatedUsage: UsageBreakdown = emptyUsageBreakdown();
-  let lastCumulativeUsageKey: string | undefined;
+  // Last cumulative total seen per thread; Codex repeats snapshots, so an
+  // unchanged total must not be added twice.
+  const lastTotalKeyByThread = new Map<string, string>();
   const textByItem = new Map<string, string>();
   const reasoningByItem = new Map<string, string>();
   const nativeToolCalls = new Map<string, NativeToolCall>();
@@ -225,18 +227,24 @@ export function createAppServerEventHandler({
       if (
         notification.method === 'thread/tokenUsage/updated' &&
         params != null &&
-        matchesActiveTurn({ params, activeThreadId, activeTurnId })
+        isUsageForThisTurn({ params, activeThreadId, activeTurnId })
       ) {
+        const threadId = params.threadId as string;
         const tokenUsage = asRecord(params.tokenUsage);
         const total = readUsageBreakdown(tokenUsage?.total);
         const last = readUsageBreakdown(tokenUsage?.last);
         if (total != null && last != null) {
           const key = usageKey(total);
-          if (key !== lastCumulativeUsageKey) {
-            lastCumulativeUsageKey = key;
+          if (key !== lastTotalKeyByThread.get(threadId)) {
+            lastTotalKeyByThread.set(threadId, key);
             accumulatedUsage = addUsage({
               total: accumulatedUsage,
               increment: last,
+            });
+            // Report as it happens so an aborted or failed turn keeps its usage.
+            emitStreamEvent({
+              type: 'usage.updated',
+              usage: toLegacyUsage(accumulatedUsage),
             });
           }
         }
@@ -458,6 +466,28 @@ function matchesActiveTurn({
     params.threadId === activeThreadId &&
     turnId === activeTurnId
   );
+}
+
+/*
+ * Usage from the active thread must belong to the active turn. Usage from any
+ * other thread on this app-server connection (e.g. a spawned sub-agent) is
+ * counted too, since its tokens are part of the work this turn triggered.
+ */
+function isUsageForThisTurn({
+  params,
+  activeThreadId,
+  activeTurnId,
+}: {
+  params: Record<string, unknown>;
+  activeThreadId: string | undefined;
+  activeTurnId: string | undefined;
+}): boolean {
+  if (activeThreadId == null || typeof params.threadId !== 'string') {
+    return false;
+  }
+  return params.threadId === activeThreadId
+    ? matchesActiveTurn({ params, activeThreadId, activeTurnId })
+    : true;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
