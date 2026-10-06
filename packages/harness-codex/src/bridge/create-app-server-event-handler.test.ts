@@ -449,12 +449,11 @@ describe('createAppServerEventHandler', () => {
 });
 
 describe('token usage reporting', () => {
-  it('reports usage live, counts other threads, and keeps it if the turn never completes', () => {
+  function createUsageHarness() {
     let turnUsage: Record<string, unknown> = defaultUsage();
-    const stepUsages: unknown[] = [];
-    const send = (event: Record<string, unknown>) => {
-      if (event.type === 'finish-step') stepUsages.push(event.usage);
-    };
+    const emitted: Array<Record<string, unknown>> = [];
+    const send = (event: Record<string, unknown>) => emitted.push(event);
+    const emitError = vi.fn();
     const stepTracker = createCodexStepTracker({
       send,
       getTurnUsage: () => turnUsage,
@@ -467,65 +466,137 @@ describe('token usage reporting', () => {
         setTurnUsage: usage => (turnUsage = usage),
         setThreadId: () => {},
         emitWarning: vi.fn(),
-        emitError: vi.fn(),
+        emitError,
       }),
       emitWarning: vi.fn(),
-      emitError: vi.fn(),
+      emitError,
     });
-    handler.announceThread('thread-1');
-    handler.setTurnId('turn-1');
+    handler.announceThread('parent');
+    handler.setTurnId('parent-turn');
 
-    const report = (
-      threadId: string,
-      turnId: string,
-      input: number,
-      output: number,
-      lastInput = input,
-      lastOutput = output,
-    ) =>
-      handler.handle({
-        method: 'thread/tokenUsage/updated',
-        params: {
-          threadId,
-          turnId,
-          tokenUsage: {
-            total: usageBreakdown({ input, cached: 0, output }),
-            last: usageBreakdown({
-              input: lastInput,
-              cached: 0,
-              output: lastOutput,
-            }),
-            modelContextWindow: 100_000,
+    return {
+      emitted,
+      emitError,
+      stepTracker,
+      turnUsage: () => turnUsage,
+      report: (
+        threadId: string,
+        turnId: string,
+        total: { input: number; output: number },
+        last: { input: number; output: number } = total,
+      ) =>
+        handler.handle({
+          method: 'thread/tokenUsage/updated',
+          params: {
+            threadId,
+            turnId,
+            tokenUsage: {
+              total: usageBreakdown({ ...total, cached: 0 }),
+              last: usageBreakdown({ ...last, cached: 0 }),
+              modelContextWindow: 100_000,
+            },
           },
-        },
-      });
+        }),
+      // The parent (or a child) announcing the thread it spawned.
+      spawn: (senderThreadId: string, receiverThreadId: string) =>
+        handler.handle({
+          method: 'item/completed',
+          params: {
+            threadId: senderThreadId,
+            turnId: `${senderThreadId}-turn`,
+            item: {
+              type: 'collabAgentToolCall',
+              id: `spawn-${receiverThreadId}`,
+              tool: 'spawnAgent',
+              status: 'completed',
+              senderThreadId,
+              receiverThreadIds: [receiverThreadId],
+            },
+          },
+        }),
+      handler,
+    };
+  }
 
-    report('thread-1', 'turn-1', 10, 3);
-    report('thread-1', 'turn-1', 10, 3); // repeated snapshot: not counted twice
-    report('thread-1', 'turn-0', 99, 99); // stale turn on the active thread: ignored
-    report('sub-thread', 'sub-turn', 5, 2); // other thread: counted
+  const tokens = (usage: Record<string, unknown>) => [
+    (usage.inputTokens as { total: number }).total,
+    (usage.outputTokens as { total: number }).total,
+  ];
 
-    // The turn never completes (aborted); usage is already live.
-    expect(turnUsage).toMatchObject({
-      inputTokens: { total: 15 },
-      outputTokens: { total: 5 },
+  it('counts spawned sub-agent threads, at any depth, once announced', () => {
+    const { report, spawn, turnUsage } = createUsageHarness();
+
+    report('parent', 'parent-turn', { input: 100, output: 10 });
+    // A child reports before the parent's spawn item arrives: held back.
+    report('child', 'child-turn', { input: 40, output: 4 });
+    expect(tokens(turnUsage())).toEqual([100, 10]);
+
+    spawn('parent', 'child');
+    expect(tokens(turnUsage())).toEqual([140, 14]);
+
+    report(
+      'child',
+      'child-turn',
+      { input: 90, output: 9 },
+      { input: 50, output: 5 },
+    );
+    // A grandchild is announced by the child, not by the parent.
+    spawn('child', 'grandchild');
+    report('grandchild', 'gc-turn', { input: 7, output: 1 });
+    expect(tokens(turnUsage())).toEqual([197, 20]);
+  });
+
+  it('ignores unrelated threads, stale turns and repeated snapshots', () => {
+    const { report, spawn, turnUsage } = createUsageHarness();
+
+    report('parent', 'parent-turn', { input: 100, output: 10 });
+    report('parent', 'parent-turn', { input: 100, output: 10 }); // repeat
+    report('parent', 'old-turn', { input: 999, output: 99 }); // stale turn
+    report('stranger', 'stranger-turn', { input: 500, output: 50 }); // never announced
+    spawn('stranger-parent', 'stranger'); // sender is not part of this family
+    expect(tokens(turnUsage())).toEqual([100, 10]);
+  });
+
+  it('does not lose usage when an update is skipped', () => {
+    const { report, turnUsage } = createUsageHarness();
+
+    report('parent', 'parent-turn', { input: 100, output: 10 });
+    // The snapshot between 100 and 300 never arrived; `last` is only the final call.
+    report(
+      'parent',
+      'parent-turn',
+      { input: 300, output: 30 },
+      { input: 50, output: 5 },
+    );
+    expect(tokens(turnUsage())).toEqual([300, 30]);
+  });
+
+  it('flushes the open step with its usage before reporting a fatal error', () => {
+    const { report, stepTracker, handler, emitted, emitError } =
+      createUsageHarness();
+
+    stepTracker.observeEvent({
+      event: { type: 'item.completed', item: { type: 'agent_message' } },
+      itemId: 'msg-1',
     });
-
+    report('parent', 'parent-turn', { input: 100, output: 10 });
+    emitError.mockImplementation(() => {
+      // By the time the error is raised, the step must already be flushed.
+      expect(emitted.map(event => event.type)).toContain('finish-step');
+    });
     handler.handle({
-      method: 'item/completed',
+      method: 'error',
       params: {
-        threadId: 'thread-1',
-        turnId: 'turn-1',
-        item: { type: 'reasoning', id: 'r1', summary: [], content: [] },
+        threadId: 'parent',
+        turnId: 'parent-turn',
+        willRetry: false,
+        error: { message: 'rate limited' },
       },
     });
-    stepTracker.finishTurn();
-    expect(stepUsages).toEqual([
-      expect.objectContaining({
-        inputTokens: expect.objectContaining({ total: 15 }),
-        outputTokens: expect.objectContaining({ total: 5 }),
-      }),
-    ]);
+
+    expect(emitError).toHaveBeenCalledTimes(1);
+    const step = emitted.find(event => event.type === 'finish-step');
+    expect(tokens(step?.usage as Record<string, unknown>)).toEqual([100, 10]);
   });
 });
 

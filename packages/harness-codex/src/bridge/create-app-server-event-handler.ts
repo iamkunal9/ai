@@ -10,6 +10,11 @@ type UsageBreakdown = {
   outputTokens: number;
 };
 
+type UsageSnapshot = { total: UsageBreakdown; last: UsageBreakdown };
+
+const MAX_PENDING_USAGE_THREADS = 32;
+const MAX_PENDING_USAGE_PER_THREAD = 64;
+
 export type AppServerTurnResult = {
   status: string;
   error?: string;
@@ -43,9 +48,15 @@ export function createAppServerEventHandler({
   let activeTurnId: string | undefined;
   let settled = false;
   let accumulatedUsage: UsageBreakdown = emptyUsageBreakdown();
-  // Last cumulative total seen per thread; Codex repeats snapshots, so an
-  // unchanged total must not be added twice.
-  const lastTotalKeyByThread = new Map<string, string>();
+  // Token usage is per thread: sub-agents run as their own threads and the
+  // parent's total excludes them. A thread is counted only once it is known to
+  // belong to this turn's family, i.e. the active thread, or a thread a
+  // counted thread spawned (announced by a `collabAgentToolCall` item).
+  const countedThreads = new Set<string>();
+  const lastTotalByThread = new Map<string, UsageBreakdown>();
+  // Usage seen for a thread before its spawn was announced. Bounded so
+  // unrelated threads on the connection cannot grow it without limit.
+  const pendingUsageByThread = new Map<string, UsageSnapshot[]>();
   const textByItem = new Map<string, string>();
   const reasoningByItem = new Map<string, string>();
   const nativeToolCalls = new Map<string, NativeToolCall>();
@@ -56,6 +67,7 @@ export function createAppServerEventHandler({
   const announceThread = (threadId: string): void => {
     if (activeThreadId != null) return;
     activeThreadId = threadId;
+    countedThreads.add(threadId);
     emitStreamEvent({ type: 'thread.started', thread_id: threadId });
   };
 
@@ -157,6 +169,62 @@ export function createAppServerEventHandler({
     });
   };
 
+  const recordUsage = (
+    threadId: string,
+    { total, last }: UsageSnapshot,
+  ): void => {
+    const previous = lastTotalByThread.get(threadId);
+    // Diff cumulative totals so a repeated or skipped snapshot never
+    // double counts; the first snapshot of a thread falls back to `last`
+    // (a resumed thread's total includes earlier turns).
+    const increment =
+      previous == null ? last : positiveDifference(total, previous);
+    lastTotalByThread.set(
+      threadId,
+      previous == null ? total : maxUsage(previous, total),
+    );
+    accumulatedUsage = addUsage({ total: accumulatedUsage, increment });
+    // Report as it happens so an aborted or failed turn keeps its usage.
+    emitStreamEvent({
+      type: 'usage.updated',
+      usage: toLegacyUsage(accumulatedUsage),
+    });
+  };
+
+  const countThread = (threadId: string): void => {
+    if (countedThreads.has(threadId)) return;
+    countedThreads.add(threadId);
+    for (const snapshot of pendingUsageByThread.get(threadId) ?? []) {
+      recordUsage(threadId, snapshot);
+    }
+    pendingUsageByThread.delete(threadId);
+  };
+
+  const bufferUsage = (threadId: string, snapshot: UsageSnapshot): void => {
+    const buffered = pendingUsageByThread.get(threadId);
+    if (buffered != null) {
+      if (buffered.length < MAX_PENDING_USAGE_PER_THREAD) {
+        buffered.push(snapshot);
+      }
+    } else if (pendingUsageByThread.size < MAX_PENDING_USAGE_THREADS) {
+      pendingUsageByThread.set(threadId, [snapshot]);
+    }
+  };
+
+  // A counted thread announcing the threads it spawned (at any depth).
+  const observeSpawnedThreads = (params: Record<string, unknown>): void => {
+    const item = asRecord(params.item);
+    if (item?.type !== 'collabAgentToolCall') return;
+    const sender =
+      typeof item.senderThreadId === 'string'
+        ? item.senderThreadId
+        : params.threadId;
+    if (typeof sender !== 'string' || !countedThreads.has(sender)) return;
+    for (const receiver of stringArray(item.receiverThreadIds)) {
+      countThread(receiver);
+    }
+  };
+
   return {
     announceThread,
     setTurnId(turnId) {
@@ -178,6 +246,13 @@ export function createAppServerEventHandler({
           activeTurnId = turn.id;
         }
         return;
+      }
+      if (
+        (notification.method === 'item/started' ||
+          notification.method === 'item/completed') &&
+        params != null
+      ) {
+        observeSpawnedThreads(params);
       }
       if (notification.method === 'item/started' && params != null) {
         handleItem({ eventType: 'item.started', params });
@@ -227,26 +302,22 @@ export function createAppServerEventHandler({
       if (
         notification.method === 'thread/tokenUsage/updated' &&
         params != null &&
-        isUsageForThisTurn({ params, activeThreadId, activeTurnId })
+        typeof params.threadId === 'string'
       ) {
-        const threadId = params.threadId as string;
         const tokenUsage = asRecord(params.tokenUsage);
         const total = readUsageBreakdown(tokenUsage?.total);
         const last = readUsageBreakdown(tokenUsage?.last);
-        if (total != null && last != null) {
-          const key = usageKey(total);
-          if (key !== lastTotalKeyByThread.get(threadId)) {
-            lastTotalKeyByThread.set(threadId, key);
-            accumulatedUsage = addUsage({
-              total: accumulatedUsage,
-              increment: last,
-            });
-            // Report as it happens so an aborted or failed turn keeps its usage.
-            emitStreamEvent({
-              type: 'usage.updated',
-              usage: toLegacyUsage(accumulatedUsage),
-            });
+        if (total == null || last == null) return;
+        const snapshot = { total, last };
+        if (params.threadId === activeThreadId) {
+          // Active thread: only this turn's usage (not a stale earlier turn).
+          if (matchesActiveTurn({ params, activeThreadId, activeTurnId })) {
+            recordUsage(params.threadId, snapshot);
           }
+        } else if (countedThreads.has(params.threadId)) {
+          recordUsage(params.threadId, snapshot);
+        } else {
+          bufferUsage(params.threadId, snapshot);
         }
         return;
       }
@@ -261,6 +332,8 @@ export function createAppServerEventHandler({
         if (params.willRetry === true) {
           emitWarning({ message });
         } else {
+          // Flush the open step first so its usage is not lost with the error.
+          stepTracker.finishTurn();
           emitError({ error: message, message: 'codex turn failed' });
         }
         return;
@@ -468,28 +541,6 @@ function matchesActiveTurn({
   );
 }
 
-/*
- * Usage from the active thread must belong to the active turn. Usage from any
- * other thread on this app-server connection (e.g. a spawned sub-agent) is
- * counted too, since its tokens are part of the work this turn triggered.
- */
-function isUsageForThisTurn({
-  params,
-  activeThreadId,
-  activeTurnId,
-}: {
-  params: Record<string, unknown>;
-  activeThreadId: string | undefined;
-  activeTurnId: string | undefined;
-}): boolean {
-  if (activeThreadId == null || typeof params.threadId !== 'string') {
-    return false;
-  }
-  return params.threadId === activeThreadId
-    ? matchesActiveTurn({ params, activeThreadId, activeTurnId })
-    : true;
-}
-
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value != null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -538,13 +589,28 @@ function addUsage({
   };
 }
 
-function usageKey(usage: UsageBreakdown): string {
-  return [
-    usage.inputTokens,
-    usage.cachedInputTokens,
-    usage.cacheWriteInputTokens,
-    usage.outputTokens,
-  ].join(':');
+function mapUsageFields(
+  a: UsageBreakdown,
+  b: UsageBreakdown,
+  fn: (x: number, y: number) => number,
+): UsageBreakdown {
+  return {
+    inputTokens: fn(a.inputTokens, b.inputTokens),
+    cachedInputTokens: fn(a.cachedInputTokens, b.cachedInputTokens),
+    cacheWriteInputTokens: fn(a.cacheWriteInputTokens, b.cacheWriteInputTokens),
+    outputTokens: fn(a.outputTokens, b.outputTokens),
+  };
+}
+
+function positiveDifference(
+  current: UsageBreakdown,
+  previous: UsageBreakdown,
+): UsageBreakdown {
+  return mapUsageFields(current, previous, (x, y) => Math.max(0, x - y));
+}
+
+function maxUsage(a: UsageBreakdown, b: UsageBreakdown): UsageBreakdown {
+  return mapUsageFields(a, b, Math.max);
 }
 
 function toLegacyUsage(usage: UsageBreakdown): Record<string, number> {

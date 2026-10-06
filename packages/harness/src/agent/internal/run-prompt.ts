@@ -33,7 +33,9 @@ import {
   type LanguageModelV4Usage,
 } from '@ai-sdk/provider';
 import {
+  addLanguageModelUsage,
   asLanguageModelUsage,
+  createNullLanguageModelUsage,
   parseToolCall,
   validateToolContext,
 } from 'ai/internal';
@@ -342,7 +344,6 @@ export function runPrompt<
     let pendingStopBoundary:
       | {
           finishReason: LanguageModelV4FinishReason;
-          usage: LanguageModelV4Usage;
           releaseCheckpoint: (() => void) | undefined;
         }
       | undefined;
@@ -880,11 +881,14 @@ export function runPrompt<
             ).some(Boolean)
           ) {
             await input.onStopConditionMet?.();
-            const { usage } = pendingStopBoundary;
             releasePendingStopBoundary();
+            // The turn total is every completed step, not just the last one.
             await lifecycle.end({
               steps: completedSteps,
-              usage: asLanguageModelUsage(usage),
+              usage: completedSteps.reduce(
+                (total, step) => addLanguageModelUsage(total, step.usage),
+                createNullLanguageModelUsage(),
+              ),
             });
             await result.finish();
             return;
@@ -1186,7 +1190,6 @@ export function runPrompt<
           if (input.stopConditions != null && input.stopConditions.length > 0) {
             pendingStopBoundary = {
               finishReason: value.finishReason,
-              usage: value.usage,
               releaseCheckpoint: pinSandboxChannelEventCheckpoint(value),
             };
           }

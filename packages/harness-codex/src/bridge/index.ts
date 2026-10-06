@@ -82,6 +82,8 @@ async function runTurn(start: StartMessage, turn: BridgeTurn): Promise<void> {
     });
   } catch (error) {
     if (!turn.abortSignal.aborted) {
+      // Flush the open step first so its usage is not lost with the error.
+      stepTracker.finishTurn();
       turn.emitError({ error, message: 'codex turn failed' });
     }
     return;
