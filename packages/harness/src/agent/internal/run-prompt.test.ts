@@ -658,6 +658,39 @@ describe('runPrompt raw parts', () => {
   });
 });
 
+describe('runPrompt raw parts at a stop boundary', () => {
+  test('forwards a raw part that arrives right after the step a stop condition ends on', async () => {
+    const { result, done } = runPrompt({
+      harness,
+      session: fakeSession([
+        { type: 'stream-start' },
+        finishEvents[0]!,
+        // The next part is evaluated against the stop condition; sideband data
+        // must neither trigger that check nor be swallowed by it.
+        { type: 'raw', rawValue: { marker: 'usage-after-step' } },
+        { type: 'text-delta', id: 't', delta: 'ignored' },
+      ]),
+      prompt: 'go',
+      instructions: undefined,
+      tools: {} as ToolSet,
+      toolSpecs: [],
+      sandboxSession,
+      sessionWorkDir: WORK_DIR,
+      runtimeContext: {} as never,
+      abortSignal: undefined,
+      stopConditions: [({ steps }) => steps.length === 1],
+    });
+
+    const raws: unknown[] = [];
+    for await (const part of result.fullStream) {
+      if (part.type === 'raw') raws.push(part.rawValue);
+    }
+    await done;
+
+    expect(raws).toEqual([{ marker: 'usage-after-step' }]);
+  });
+});
+
 describe('runPrompt stop-condition telemetry', () => {
   test('reports the usage of every step as the turn total when a stop condition ends the turn', async () => {
     const stepUsage = (input: number, output: number) => ({

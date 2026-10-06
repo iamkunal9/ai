@@ -42,7 +42,12 @@ await runBridge<StartMessage>({
 type Emit = (msg: Record<string, unknown>) => void;
 
 async function runTurn(start: StartMessage, turn: BridgeTurn): Promise<void> {
-  const emit: Emit = msg => turn.emit(msg as BridgeEvent);
+  // The host stops listening on abort. Events the aborted turn still produces
+  // (e.g. the flush when Codex reports the interrupt) must not leak into the
+  // next turn's stream, so drop them.
+  const emit: Emit = msg => {
+    if (!turn.abortSignal.aborted) turn.emit(msg as BridgeEvent);
+  };
 
   if (start.restartThread) {
     threadState.id = undefined;

@@ -9,7 +9,12 @@ type AppServerOptions = {
   threadId: string | undefined;
   codexModel: string | undefined;
   codexConfig: Record<string, unknown>;
-  emitStreamEvent(event: { type: 'thread.started'; thread_id: string }): void;
+  emitStreamEvent(event: {
+    type: 'thread.started' | 'usage.updated';
+    thread_id?: string;
+    usage?: Record<string, number>;
+  }): void;
+  stepTracker: { finishTurn(): void };
 };
 
 const CODEX_ENV_KEYS = [
@@ -45,6 +50,9 @@ const state = vi.hoisted(() => ({
     },
   ] as Array<Record<string, unknown>>,
   appServerOptions: [] as AppServerOptions[],
+  emitted: [] as Array<{ type: string }>,
+  abortController: new AbortController(),
+  onRunTurn: undefined as ((options: AppServerOptions) => void) | undefined,
   appServerError: undefined as Error | undefined,
   appServerClosed: 0,
   runSecondTurn: false,
@@ -87,10 +95,10 @@ vi.mock('@ai-sdk/harness/bridge', () => ({
       tools: state.startTools,
     };
     const turn = {
-      emit: () => {},
+      emit: (message: { type: string }) => state.emitted.push(message),
       emitError: (error: unknown) => state.emittedErrors.push(error),
       requestToolResult: async () => ({ output: {} }),
-      abortSignal: new AbortController().signal,
+      abortSignal: state.abortController.signal,
       experimental_userMessages: {
         pendingCount: 0,
         close: () => {},
@@ -115,6 +123,7 @@ vi.mock('./codex-app-server-driver', () => ({
         type: 'thread.started',
         thread_id: 'app-server-thread',
       });
+      state.onRunTurn?.(options);
     },
     close: async () => {
       state.appServerClosed++;
@@ -141,6 +150,9 @@ describe('Codex bridge config', () => {
       },
     ];
     state.appServerOptions = [];
+    state.emitted = [];
+    state.abortController = new AbortController();
+    state.onRunTurn = undefined;
     state.appServerError = undefined;
     state.appServerClosed = 0;
     state.runSecondTurn = false;
@@ -185,6 +197,28 @@ describe('Codex bridge config', () => {
 
     expect(state.appServerOptions).toHaveLength(1);
     expect(state.appServerOptions[0]?.start.tools).toEqual([]);
+  });
+
+  test('drops what an aborted turn still produces so it cannot leak into the next turn', async () => {
+    const usage = (input: number) => ({
+      input_tokens: input,
+      output_tokens: 1,
+    });
+    state.onRunTurn = options => {
+      options.emitStreamEvent({ type: 'usage.updated', usage: usage(5) });
+      state.abortController.abort();
+      // Codex reports the interrupt after the host has already moved on.
+      options.emitStreamEvent({ type: 'usage.updated', usage: usage(50) });
+      options.stepTracker.finishTurn();
+    };
+
+    await import('./index');
+
+    const types = state.emitted.map(message => message.type);
+    expect(types).toContain('raw'); // the one reported before the abort
+    expect(types.filter(type => type === 'raw')).toHaveLength(1);
+    expect(types).not.toContain('finish-step');
+    expect(types).not.toContain('finish');
   });
 
   test('reuses one runtime for turns and closes on stop and destroy', async () => {

@@ -868,6 +868,19 @@ export function runPrompt<
         }
         if (value == null) continue;
 
+        // `raw` is out-of-band adapter data: it must not open a step (span),
+        // become part of one, or trigger a pending stop-condition check, so
+        // pass it straight through.
+        if (value.type === 'raw') {
+          for (const part of translateStreamPart<TOOLS>(
+            value,
+            translateOptions,
+          )) {
+            result.enqueueContinuation(part);
+          }
+          continue;
+        }
+
         if (pendingStopBoundary != null) {
           if (value.type === 'finish') {
             releasePendingStopBoundary();
@@ -903,18 +916,6 @@ export function runPrompt<
           const modelId = value.modelId ?? input.model;
           if (modelId != null) result.setModelId(modelId);
           await lifecycle.start(modelId);
-        }
-
-        // `raw` is out-of-band adapter data: it must not open a step (span) or
-        // become part of one, so pass it straight through.
-        if (value.type === 'raw') {
-          for (const part of translateStreamPart<TOOLS>(
-            value,
-            translateOptions,
-          )) {
-            result.enqueueContinuation(part);
-          }
-          continue;
         }
 
         // Open a step span lazily before the first content of each step.

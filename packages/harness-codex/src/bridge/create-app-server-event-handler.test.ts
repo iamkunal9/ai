@@ -594,7 +594,7 @@ describe('token usage reporting', () => {
 
     report('parent', 'parent-turn', { input: 100, output: 10 });
     report('parent', 'parent-turn', { input: 100, output: 10 }); // repeat
-    report('parent', 'old-turn', { input: 999, output: 99 }); // stale turn
+    report('parent', 'old-turn', { input: 100, output: 10 }); // replayed snapshot
     report('stranger', 'stranger-turn', { input: 500, output: 50 }); // never announced
     spawn('stranger-parent', 'stranger'); // sender is not part of this family
     expect(tokens(turnUsage())).toEqual([100, 10]);

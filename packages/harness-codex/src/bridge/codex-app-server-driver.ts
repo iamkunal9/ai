@@ -102,8 +102,12 @@ export function createCodexAppServerRuntime(): {
     const handler = createAppServerEventHandler({
       stepTracker: options.stepTracker,
       emitStreamEvent: options.emitStreamEvent,
-      emitWarning: turn.emitWarning,
-      emitError: turn.emitError,
+      emitWarning: input => {
+        if (!turn.abortSignal.aborted) turn.emitWarning(input);
+      },
+      emitError: input => {
+        if (!turn.abortSignal.aborted) turn.emitError(input);
+      },
       usageLedger,
     });
     const dynamicTools = createDynamicTools(start.tools ?? []);

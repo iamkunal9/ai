@@ -9,11 +9,13 @@ import type { CodexAppServerNotification } from './codex-app-server-client';
  * `collabAgentToolCall` items on the thread that started or addressed them.
  *
  * The ledger keeps two cumulative totals per thread: what the server has
- * `seen`, and what has been `billed` to a turn. A thread's increment is always
- * `seen - billed`, so a repeated snapshot adds nothing, a skipped snapshot is
- * recovered by the next one, and usage that arrives while no turn is attached
- * (between turns, or after an abort) is carried over to the next turn instead
- * of being lost.
+ * `seen`, and what has been `billed`. A thread's increment is always
+ * `seen - billed` per field, never negative, so a repeated or replayed
+ * snapshot adds nothing and a skipped snapshot is recovered by the next one.
+ * Usage that arrives while no turn is attached (between turns, or after an
+ * abort) accumulates and is billed to the next turn instead of being lost.
+ * The policy is to never over-bill: when a history cannot be told apart from
+ * new usage, it is not billed.
  *
  * Only the session's own threads are billed: the active thread plus the threads
  * it spawned, at any depth. State lives as long as the app-server process.
@@ -35,11 +37,12 @@ type UsageSnapshot = { total: UsageBreakdown; last: UsageBreakdown };
  *   sub-agent), so everything it used is ours.
  * - `unknown`: the thread existed before we saw it (a resumed thread, or an
  *   existing sub-agent we are only now addressing). Its `total` includes
- *   history, so only the `last` model call is billed unless a baseline is known.
+ *   history, so without a known baseline only the session's own thread is billed
+ *   for its `last` call, and any other thread is merely baselined.
  */
 type ThreadOrigin = 'new' | 'unknown';
 
-type PendingSpawn = { receiverThreadId: string; origin: ThreadOrigin };
+type PendingSpawns = Map<string, ThreadOrigin>; // receiver -> origin
 
 type ActiveTurn = {
   threadId: string;
@@ -49,9 +52,9 @@ type ActiveTurn = {
 };
 
 // Bounds for threads on the connection that are not (yet) known to be ours.
-const MAX_UNCLAIMED_THREADS = 256;
+const MAX_UNCLAIMED_THREADS = 1024;
 const MAX_PENDING_SPAWN_SENDERS = 256;
-const MAX_PENDING_SPAWNS_PER_SENDER = 64;
+const MAX_PENDING_SPAWNS_PER_SENDER = 256;
 
 export type CodexUsageLedger = {
   /**
@@ -80,43 +83,69 @@ export function createCodexUsageLedger(): CodexUsageLedger {
   const family = new Map<string, ThreadOrigin>();
   const seen = new Map<string, UsageSnapshot>();
   const billed = new Map<string, UsageBreakdown>();
-  const pendingSpawns = new Map<string, PendingSpawn[]>();
+  const pendingSpawns = new Map<string, PendingSpawns>();
+  let primaryThreadId: string | undefined;
   let active: ActiveTurn | undefined;
   let turnTotal = emptyUsage();
+  // Billed while no turn was attached; handed to the next turn.
+  let carryOver = emptyUsage();
 
   // Bill whatever a family thread has used since it was last billed.
   const settle = (threadId: string): void => {
     const origin = family.get(threadId);
     const snapshot = seen.get(threadId);
-    if (active == null || origin == null || snapshot == null) return;
+    if (origin == null || snapshot == null) return;
 
     const previous = billed.get(threadId);
     const increment =
       previous == null
         ? origin === 'new'
           ? snapshot.total
-          : snapshot.last
-        : isRegression(snapshot.total, previous)
-          ? // A total that went down means the counter was reset (e.g. after a
-            // compaction). Never over-bill: take only the last call.
-            snapshot.last
-          : difference(snapshot.total, previous);
-    billed.set(threadId, snapshot.total);
+          : // History we cannot tell apart from new usage is not billed,
+            // except the last call of the thread this session is running.
+            threadId === primaryThreadId
+            ? snapshot.last
+            : emptyUsage()
+        : // Per field and never negative: a replayed or reset total is not
+          // billed again.
+          difference(snapshot.total, previous);
+    billed.set(
+      threadId,
+      previous == null ? snapshot.total : maxUsage(previous, snapshot.total),
+    );
     if (isEmpty(increment)) return;
 
+    if (active == null) {
+      carryOver = add(carryOver, increment);
+      return;
+    }
     turnTotal = add(turnTotal, increment);
     active.onChange(turnTotal);
   };
 
   // Make a thread part of the session, replaying what we already know of it.
   const adopt = (threadId: string, origin: ThreadOrigin): void => {
-    if (family.has(threadId)) return;
+    if (family.has(threadId)) {
+      // A spawn announcement proves a thread new, if nothing was billed for it
+      // yet on the assumption that it was not.
+      if (
+        origin === 'new' &&
+        family.get(threadId) === 'unknown' &&
+        !billed.has(threadId)
+      ) {
+        family.set(threadId, 'new');
+        settle(threadId);
+      }
+      return;
+    }
     family.set(threadId, origin);
     settle(threadId);
     const queued = pendingSpawns.get(threadId);
     if (queued == null) return;
     pendingSpawns.delete(threadId);
-    for (const spawn of queued) adopt(spawn.receiverThreadId, spawn.origin);
+    for (const [receiverThreadId, receiverOrigin] of queued) {
+      adopt(receiverThreadId, receiverOrigin);
+    }
   };
 
   const rememberSnapshot = (
@@ -146,8 +175,9 @@ export function createCodexUsageLedger(): CodexUsageLedger {
     if (total == null || last == null) return;
     const snapshot: UsageSnapshot = { total, last };
 
-    // On the active thread, usage that is not from this turn (Codex replays the
-    // latest snapshot when a thread is resumed, before the turn starts) is a
+    // On the active thread, a snapshot that is not from this turn and arrives
+    // before anything was billed for a resumed thread is the replay of its
+    // history (Codex replays the latest snapshot when a thread is resumed): a
     // baseline, not new usage. Before the turn id is known only a thread we
     // created can be reporting current usage.
     if (active?.threadId === threadId) {
@@ -155,8 +185,12 @@ export function createCodexUsageLedger(): CodexUsageLedger {
         active.turnId != null
           ? params.turnId === active.turnId
           : family.get(threadId) === 'new';
-      if (!isCurrent) {
-        if (!billed.has(threadId)) billed.set(threadId, total);
+      if (
+        !isCurrent &&
+        !billed.has(threadId) &&
+        family.get(threadId) !== 'new'
+      ) {
+        billed.set(threadId, total);
         return;
       }
     }
@@ -185,34 +219,42 @@ export function createCodexUsageLedger(): CodexUsageLedger {
     for (const receiverThreadId of receivers) {
       if (family.has(sender)) {
         adopt(receiverThreadId, origin);
-      } else {
-        // The sender is not ours yet; it may become ours (e.g. a grandchild
-        // announced before its parent), so remember the announcement.
-        const queued = pendingSpawns.get(sender) ?? [];
-        if (queued.length < MAX_PENDING_SPAWNS_PER_SENDER) {
-          queued.push({ receiverThreadId, origin });
+        continue;
+      }
+      // The sender is not ours yet; it may become ours (e.g. a grandchild
+      // announced before its parent), so remember the announcement.
+      const queued: PendingSpawns = pendingSpawns.get(sender) ?? new Map();
+      if (
+        queued.size < MAX_PENDING_SPAWNS_PER_SENDER ||
+        queued.has(receiverThreadId)
+      ) {
+        // A spawn is the stronger statement about a thread's origin.
+        if (queued.get(receiverThreadId) !== 'new') {
+          queued.set(receiverThreadId, origin);
         }
-        pendingSpawns.set(sender, queued);
-        if (pendingSpawns.size > MAX_PENDING_SPAWN_SENDERS) {
-          const oldest = pendingSpawns.keys().next().value;
-          if (oldest != null) pendingSpawns.delete(oldest);
-        }
+      }
+      pendingSpawns.set(sender, queued);
+      if (pendingSpawns.size > MAX_PENDING_SPAWN_SENDERS) {
+        const oldest = pendingSpawns.keys().next().value;
+        if (oldest != null) pendingSpawns.delete(oldest);
       }
     }
   };
 
   return {
     begin({ threadId, resumed, onChange, onWarning }) {
+      primaryThreadId = threadId;
       active = { threadId, turnId: undefined, onChange, onWarning };
-      turnTotal = emptyUsage();
-      // Whatever a resumed thread had used before this turn is not ours.
+      turnTotal = carryOver;
+      carryOver = emptyUsage();
+      // Whatever a thread we did not create had used before this turn is not ours.
       const preTurn = seen.get(threadId);
       if (resumed && preTurn != null && !billed.has(threadId)) {
         billed.set(threadId, preTurn.total);
       }
       adopt(threadId, resumed ? 'unknown' : 'new');
-      // Bill usage that arrived while no turn was attached.
       for (const familyThreadId of family.keys()) settle(familyThreadId);
+      if (!isEmpty(turnTotal)) onChange(turnTotal);
     },
     setTurnId(turnId) {
       if (active != null) active.turnId = turnId;
@@ -238,8 +280,10 @@ export function createCodexUsageLedger(): CodexUsageLedger {
       seen.clear();
       billed.clear();
       pendingSpawns.clear();
+      primaryThreadId = undefined;
       active = undefined;
       turnTotal = emptyUsage();
+      carryOver = emptyUsage();
     },
   };
 }
@@ -299,13 +343,13 @@ const add = (a: UsageBreakdown, b: UsageBreakdown) =>
   mapFields(a, b, (x, y) => x + y);
 
 const difference = (current: UsageBreakdown, previous: UsageBreakdown) =>
-  mapFields(current, previous, (x, y) => x - y);
+  mapFields(current, previous, (x, y) => Math.max(0, x - y));
+
+const maxUsage = (a: UsageBreakdown, b: UsageBreakdown) =>
+  mapFields(a, b, Math.max);
 
 const isEmpty = (usage: UsageBreakdown) =>
   USAGE_FIELDS.every(field => usage[field] === 0);
-
-const isRegression = (current: UsageBreakdown, previous: UsageBreakdown) =>
-  USAGE_FIELDS.some(field => current[field] < previous[field]);
 
 function numberOrZero(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0

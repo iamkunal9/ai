@@ -185,7 +185,7 @@ describe('CodexUsageLedger', () => {
       expect(s.total()).toEqual({ input: 80, output: 8 });
     });
 
-    it('ignores a stale turn once a baseline exists', () => {
+    it('bills a late increase from a previous turn but never a replayed total', () => {
       const s = createSession();
       s.begin('p');
       s.feed(
@@ -194,28 +194,37 @@ describe('CodexUsageLedger', () => {
           turnId: 'p-turn',
           total: { input: 100, output: 10 },
         }),
+        // The same snapshot replayed under an old turn id adds nothing.
         usageNotification({
           threadId: 'p',
           turnId: 'old-turn',
-          total: { input: 999, output: 99 },
+          total: { input: 100, output: 10 },
         }),
       );
       expect(s.total()).toEqual({ input: 100, output: 10 });
+      // A real increase reported under a previous turn id is still our usage.
+      s.feed(
+        usageNotification({
+          threadId: 'p',
+          turnId: 'old-turn',
+          total: { input: 130, output: 13 },
+        }),
+      );
+      expect(s.total()).toEqual({ input: 130, output: 13 });
     });
 
-    it('takes only the last call when a total goes down (counter reset)', () => {
+    it('never bills a total that went down, nor re-bills it when it comes back up', () => {
       const s = createSession();
       s.begin('p');
-      const at = (input: number, last: number) =>
+      const at = (input: number) =>
         usageNotification({
           threadId: 'p',
           turnId: 'p-turn',
           total: { input, output: 0 },
-          last: { input: last, output: 0 },
         });
-      s.feed(at(100, 100), at(20, 20), at(50, 30));
-      // 100, then the reset (+20 last), then +30 on the new counter.
-      expect(s.total()).toEqual({ input: 150, output: 0 });
+      // 100, a replayed older 20, the real 200 again, then 230.
+      s.feed(at(100), at(20), at(200), at(200), at(230));
+      expect(s.total()).toEqual({ input: 230, output: 0 });
     });
 
     it('carries reasoning tokens through', () => {
@@ -369,7 +378,7 @@ describe('CodexUsageLedger', () => {
       expect(counts(s.ledger.turnUsage())).toEqual({ input: 30, output: 3 });
     });
 
-    it('bills an existing child addressed by wait only for its last call', () => {
+    it('only baselines an existing child addressed by wait, then bills what it uses', () => {
       const s = createSession();
       s.begin('p');
       s.feed(
@@ -385,7 +394,16 @@ describe('CodexUsageLedger', () => {
           last: { input: 60, output: 6 },
         }),
       );
-      expect(s.total()).toEqual({ input: 60, output: 6 });
+      // Its history cannot be told apart from new usage, so it is not billed.
+      expect(s.total()).toEqual({ input: 0, output: 0 });
+      s.feed(
+        usageNotification({
+          threadId: 'old-child',
+          turnId: 'x',
+          total: { input: 9100, output: 905 },
+        }),
+      );
+      expect(s.total()).toEqual({ input: 100, output: 5 });
     });
   });
 
@@ -498,12 +516,170 @@ describe('CodexUsageLedger', () => {
     });
   });
 
+  describe('review regressions', () => {
+    it('bills a fresh thread whose first snapshot arrives after its turn ended', () => {
+      const s = createSession();
+      s.begin('p', { turnId: 't1' });
+      s.ledger.end(); // the turn finished before Codex reported anything
+      s.feed(
+        usageNotification({
+          threadId: 'p',
+          turnId: 't1',
+          total: { input: 100, output: 10 },
+        }),
+      );
+      s.begin('p', { resumed: true, turnId: 't2' });
+      expect(s.total()).toEqual({ input: 100, output: 10 });
+    });
+
+    it('bills a late previous-turn increase that arrives after the next turn began', () => {
+      const s = createSession();
+      s.begin('p', { turnId: 't1' });
+      s.feed(
+        usageNotification({
+          threadId: 'p',
+          turnId: 't1',
+          total: { input: 100, output: 10 },
+        }),
+      );
+      s.ledger.end();
+      s.begin('p', { resumed: true, turnId: 't2' });
+      s.feed(
+        usageNotification({
+          threadId: 'p',
+          turnId: 't1',
+          total: { input: 140, output: 14 },
+        }),
+      );
+      expect(s.total()).toEqual({ input: 40, output: 4 });
+    });
+
+    it('accumulates everything reported while detached, however it moved', () => {
+      const s = createSession();
+      s.begin('p');
+      s.feed(
+        collabNotification({ sender: 'p', receivers: ['c'] }),
+        usageNotification({
+          threadId: 'c',
+          turnId: 'c1',
+          total: { input: 100, output: 10 },
+        }),
+      );
+      s.ledger.end();
+      const at = (input: number) =>
+        usageNotification({
+          threadId: 'c',
+          turnId: 'c1',
+          total: { input, output: 0 },
+        });
+      s.feed(at(150), at(80), at(190), at(190));
+      s.begin('p', { resumed: true, turnId: 't2' });
+      expect(s.total()).toEqual({ input: 90, output: 0 });
+    });
+
+    it('treats a child as new when its spawn is announced after a wait on it', () => {
+      const s = createSession();
+      s.begin('p');
+      s.feed(
+        collabNotification({ sender: 'p', receivers: ['c'], tool: 'wait' }),
+        collabNotification({
+          sender: 'p',
+          receivers: ['c'],
+          tool: 'spawnAgent',
+        }),
+        usageNotification({
+          threadId: 'c',
+          turnId: 'c1',
+          total: { input: 300, output: 30 },
+          last: { input: 100, output: 10 },
+        }),
+      );
+      expect(s.total()).toEqual({ input: 300, output: 30 });
+    });
+
+    it('adopts every queued descendant, announced repeatedly', () => {
+      const s = createSession();
+      s.begin('p');
+      const grandchildren = Array.from({ length: 80 }, (_, i) => `g${i}`);
+      for (const id of grandchildren) {
+        s.feed(
+          // started and completed announce the same receiver twice
+          collabNotification({ sender: 'child', receivers: [id] }),
+          collabNotification({ sender: 'child', receivers: [id] }),
+          usageNotification({
+            threadId: id,
+            turnId: id,
+            total: { input: 10, output: 1 },
+          }),
+        );
+      }
+      s.feed(collabNotification({ sender: 'p', receivers: ['child'] }));
+      expect(s.total()).toEqual({ input: 800, output: 80 });
+    });
+
+    it('carries cache and reasoning counts', () => {
+      const s = createSession();
+      s.begin('p');
+      s.feed({
+        method: 'thread/tokenUsage/updated',
+        params: {
+          threadId: 'p',
+          turnId: 'p-turn',
+          tokenUsage: {
+            total: {
+              inputTokens: 100,
+              cachedInputTokens: 60,
+              cacheWriteInputTokens: 7,
+              outputTokens: 10,
+              reasoningOutputTokens: 4,
+            },
+            last: breakdown({ input: 100, output: 10 }),
+          },
+        },
+      });
+      expect(s.ledger.turnUsage()).toEqual({
+        inputTokens: 100,
+        cachedInputTokens: 60,
+        cacheWriteInputTokens: 7,
+        outputTokens: 10,
+        reasoningOutputTokens: 4,
+      });
+    });
+
+    it('never bills a negative or non-numeric count', () => {
+      const s = createSession();
+      s.begin('p');
+      s.feed({
+        method: 'thread/tokenUsage/updated',
+        params: {
+          threadId: 'p',
+          turnId: 'p-turn',
+          tokenUsage: {
+            total: {
+              inputTokens: -50,
+              outputTokens: Number.NaN,
+              cachedInputTokens: 'x',
+            },
+            last: { inputTokens: -50 },
+          },
+        },
+      } as CodexAppServerNotification);
+      expect(s.ledger.turnUsage()).toEqual({
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        cacheWriteInputTokens: 0,
+        outputTokens: 0,
+        reasoningOutputTokens: 0,
+      });
+    });
+  });
+
   describe('bounds', () => {
     it('drops unrelated threads past the limit with a warning, never family threads', () => {
       const s = createSession();
       s.begin('p');
       s.feed(collabNotification({ sender: 'p', receivers: ['c'] }));
-      for (let i = 0; i < 300; i++) {
+      for (let i = 0; i < 1100; i++) {
         s.feed(
           usageNotification({
             threadId: `stranger-${i}`,
